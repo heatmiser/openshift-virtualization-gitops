@@ -3,6 +3,8 @@
 
   # Ignore based on any subset of the file path
   paths = [
-    "components/external-dns-configuration/rfc2136-tsig-secret.yaml"
+    "components/external-dns-configuration/rfc2136-tsig-secret.yaml",
 
+    # Ignore anything with the word funkychunkymonkey anywhere in the path
+    '''funkychunkymonkey'''
   ]
