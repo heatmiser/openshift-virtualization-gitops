@@ -1,0 +1,147 @@
+---
+- name: End-to-End Provisioning of OpenShift and ACM Hub via Ansible/GitOps
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # --- Phase 1: Base Cluster Vars ---
+    cluster_name: "hub" # Must match the folder name in clusters/
+    install_dir: "/opt/openshift-install/{{ cluster_name }}"
+    openshift_install_binary: "/usr/local/bin/openshift-install"
+    iso_path: "{{ install_dir }}/agent.x86_64.iso"
+    
+    # Define your bare-metal hosts for the Hub cluster
+    bm_hosts:
+      - name: hub-master-0
+        bmc_address: "10.9.48.100"
+        bmc_user: "admin"
+        bmc_password: "password"
+      # Add master-1 and master-2 here...
+
+    # --- Phase 2: GitOps Bootstrap Vars ---
+    gitops_repo: "https://github.com/<your-org>/openshift-virtualization-gitops.git" # Replace with your repo
+    # These will be dynamically fetched, but defaults can be set
+    cluster_base_domain: ""
+    platform_base_domain: ""
+
+  tasks:
+    # ========================================================================
+    # PHASE 1: STANDALONE BARE-METAL INSTALLATION
+    # ========================================================================
+    - name: Ensure installation directory exists
+      ansible.builtin.file:
+        path: "{{ install_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Generate install-config.yaml
+      ansible.builtin.template:
+        src: templates/install-config.yaml.j2
+        dest: "{{ install_dir }}/install-config.yaml"
+        mode: '0644'
+
+    - name: Generate agent-config.yaml
+      ansible.builtin.template:
+        src: templates/agent-config.yaml.j2
+        dest: "{{ install_dir }}/agent-config.yaml"
+        mode: '0644'
+
+    - name: Generate the Agent-Based Installer ISO
+      ansible.builtin.command:
+        cmd: "{{ openshift_install_binary }} agent create image --dir={{ install_dir }}"
+      args:
+        creates: "{{ iso_path }}"
+
+# Or adjust for a dedicated server available to host the Discovery ISO via HTTP for the bare-metal nodes to boot from
+    - name: Host the ISO on a local webserver for virtual media attachment
+      ansible.builtin.copy:
+        src: "{{ iso_path }}"
+        dest: "/var/www/html/{{ cluster_name }}-agent.iso"
+        mode: '0644'
+
+# Or adjust to utilize dedicated server defined above
+    - name: Mount ISO via Redfish and boot Bare-Metal Hosts
+      community.general.redfish_command:
+        category: Manager
+        command: VirtualMediaInsert
+        baseuri: "{{ item.bmc_address }}"
+        username: "{{ item.bmc_user }}"
+        password: "{{ item.bmc_password }}"
+        virtual_media:
+          image_url: "http://<your-ansible-node-ip>/{{ cluster_name }}-agent.iso"
+          inserted: true
+      loop: "{{ bm_hosts }}"
+
+    - name: Power cycle Bare-Metal Hosts to boot from ISO
+      community.general.redfish_command:
+        category: Systems
+        command: PowerForceRestart
+        baseuri: "{{ item.bmc_address }}"
+        username: "{{ item.bmc_user }}"
+        password: "{{ item.bmc_password }}"
+      loop: "{{ bm_hosts }}"
+
+    - name: Wait for OpenShift installation to complete (This will take 30-60+ mins)
+      ansible.builtin.command:
+        cmd: "{{ openshift_install_binary }} agent wait-for install-complete --dir={{ install_dir }}"
+      register: install_status
+      until: install_status.rc == 0
+      retries: 120
+      delay: 60
+
+    # ========================================================================
+    # PHASE 2: GITOPS & ACM BOOTSTRAP
+    # ========================================================================
+    - name: Set KUBECONFIG environment variable for the new cluster
+      ansible.builtin.set_fact:
+        k8s_auth_kubeconfig: "{{ install_dir }}/auth/kubeconfig"
+
+    - name: Get cluster ingress configuration to determine base domains
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig }}"
+        api_version: config.openshift.io/v1
+        kind: Ingress
+        name: cluster
+      register: ingress_info
+
+    - name: Set domain variables dynamically based on cluster config
+      ansible.builtin.set_fact:
+        cluster_base_domain: "{{ ingress_info.resources[0].spec.domain | regex_replace('^apps\\.', '') }}"
+        
+    - name: Set platform base domain variable
+      ansible.builtin.set_fact:
+        platform_base_domain: "{{ cluster_base_domain.split('.', 1)[1] }}"
+
+    - name: Apply GitOps Operator Subscription
+      kubernetes.core.k8s:
+        kubeconfig: "{{ k8s_auth_kubeconfig }}"
+        state: present
+        src: ".bootstrap/subscription.yaml" #
+
+    - name: Apply Cluster Rolebinding for GitOps
+      kubernetes.core.k8s:
+        kubeconfig: "{{ k8s_auth_kubeconfig }}"
+        state: present
+        src: ".bootstrap/cluster-rolebinding.yaml" #
+
+    - name: Wait 60 seconds for GitOps Operator to initialize
+      ansible.builtin.pause:
+        seconds: 60 #
+
+    - name: Deploy ArgoCD instance (Simulating envsubst)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ k8s_auth_kubeconfig }}"
+        state: present
+        # The lookup plugin automatically replaces variables like ${cluster_base_domain} inside the template
+        definition: "{{ lookup('ansible.builtin.template', '.bootstrap/argocd.yaml') | from_yaml }}" #
+
+    - name: Wait 30 seconds for ArgoCD instance to settle
+      ansible.builtin.pause:
+        seconds: 30 #
+
+    - name: Deploy Root Application targeting the Hub cluster (Simulating envsubst)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ k8s_auth_kubeconfig }}"
+        state: present
+        definition: "{{ lookup('ansible.builtin.template', '.bootstrap/root-application.yaml') | from_yaml }}" #
+...

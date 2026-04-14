@@ -1,0 +1,25 @@
+apiVersion: v1
+baseDomain: "{{ platform_base_domain | default('example.com') }}"
+metadata:
+  name: "{{ cluster_name }}"
+compute:
+- architecture: amd64
+  hyperthreading: Enabled
+  name: worker
+  replicas: 0
+controlPlane:
+- architecture: amd64
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+networking:
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  networkType: OVNKubernetes
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  none: {}
+pullSecret: '{{ pull_secret }}'
+sshKey: '{{ ssh_public_key }}'

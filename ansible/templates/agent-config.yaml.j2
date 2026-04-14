@@ -1,0 +1,14 @@
+apiVersion: v1alpha1
+metadata:
+  name: "{{ cluster_name }}"
+rendezvousIP: "{{ rendezvous_ip }}"
+hosts:
+{% for host in bm_hosts %}
+  - hostname: "{{ host.name }}"
+    role: master
+    interfaces:
+      - name: eth0  # Update this if your primary interface has a different name (e.g., ens192, eno1)
+        macAddress: "{{ host.mac_address }}"
+    # Note: If your environment does not use DHCP, you can append a `networkConfig` block 
+    # here for each host using NMState syntax to assign static IPs.
+{% endfor %}
