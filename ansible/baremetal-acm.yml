@@ -5,6 +5,9 @@
   gather_facts: false
   vars:
     # --- Phase 1: Base Cluster Vars ---
+    pull_secret: "OpenShift pull secret (JSON string)"
+    ssh_public_key: "ecdsa-sha2-nistp521 AAAAE2VjZHNhLfunkychunkymonkey6O2Pwaj== me@domain.test"
+    rendezvous_ip: "IP address of primary master node (used by the nodes to coordinate the installation)"
     cluster_name: "hub" # Must match the folder name in clusters/
     install_dir: "/opt/openshift-install/{{ cluster_name }}"
     openshift_install_binary: "/usr/local/bin/openshift-install"
@@ -15,7 +18,9 @@
       - name: hub-master-0
         bmc_address: "10.9.48.100"
         bmc_user: "admin"
-        bmc_password: "password"
+        bmc_password: "funkychunkymonkey"
+        # MAC address of the primary boot interface
+        macAddress: ff:ff:ff:ff:ff:ff
       # Add master-1 and master-2 here...
 
     # --- Phase 2: GitOps Bootstrap Vars ---
