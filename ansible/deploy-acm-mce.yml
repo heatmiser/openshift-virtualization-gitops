@@ -1,0 +1,364 @@
+---
+- name: Deploy Red Hat ACM or MCE on OpenShift
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Set to 'acm' or 'mce'
+    deploy_target: "acm" 
+
+    # Overrides (leave empty to auto-detect)
+    acm_channel: ""
+    mce_channel: ""
+    ocp_release_image: ""
+    storage_class: ""
+    
+    # Timeouts
+    csv_timeout: 600
+    deploy_timeout: 1200
+
+  tasks:
+    - name: Validate deploy_target
+      ansible.builtin.assert:
+        that: deploy_target in ['acm', 'mce']
+        fail_msg: "deploy_target must be either 'acm' or 'mce'"
+
+    # ==========================================
+    # Storage Class & Cluster Detection
+    # ==========================================
+    - name: Get StorageClasses
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: sc_info
+
+    - name: Set StorageClass
+      ansible.builtin.set_fact:
+        active_storage_class: >-
+          {%- if storage_class != "" -%}
+            {{ storage_class }}
+          {%- else -%}
+            {{ (sc_info.resources | selectattr('metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class', 'defined') | selectattr('metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class', 'equalto', 'true') | first).metadata.name }}
+          {%- endif -%}
+
+    - name: Get Cluster Nodes for Architecture
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: nodes_info
+
+    - name: Determine Architecture mapping
+      ansible.builtin.set_fact:
+        node_arch: "{{ nodes_info.resources[0].status.nodeInfo.architecture }}"
+        cluster_arch: >-
+          {%- if nodes_info.resources[0].status.nodeInfo.architecture == 'amd64' -%}x86_64
+          {%- elif nodes_info.resources[0].status.nodeInfo.architecture == 'arm64' -%}aarch64
+          {%- elif nodes_info.resources[0].status.nodeInfo.architecture == 's390x' -%}s390x
+          {%- elif nodes_info.resources[0].status.nodeInfo.architecture == 'ppc64le' -%}ppc64le
+          {%- endif -%}
+
+    - name: Get ClusterVersion
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: ClusterVersion
+        name: version
+      register: cv_info
+
+    - name: Set OCP Versions
+      ansible.builtin.set_fact:
+        ocp_version: "{{ cv_info.resources[0].status.desired.version }}"
+        ocp_minor: "{{ cv_info.resources[0].status.desired.version | regex_search('^[0-9]+\\.[0-9]+') }}"
+
+    - name: Get coreos-bootimages ConfigMap
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: coreos-bootimages
+        namespace: openshift-machine-config-operator
+      register: bootimages_cm
+
+    - name: Parse RHCOS JSON Stream
+      ansible.builtin.set_fact:
+        stream_data: "{{ bootimages_cm.resources[0].data.stream | from_json }}"
+
+    - name: Set RHCOS Image Details
+      ansible.builtin.set_fact:
+        rhcos_version: "{{ stream_data.architectures[cluster_arch].artifacts.metal.release }}"
+        rhcos_iso_url: "{{ stream_data.architectures[cluster_arch].artifacts.metal.formats.iso.disk.location }}"
+        release_image: "{{ ocp_release_image | default('quay.io/openshift-release-dev/ocp-release:' ~ ocp_version ~ '-' ~ cluster_arch, true) }}"
+
+    # ==========================================
+    # ACM Deployment Block
+    # ==========================================
+    - name: Deploy Advanced Cluster Management
+      when: deploy_target == 'acm'
+      block:
+        - name: Get ACM PackageManifest for default channel
+          kubernetes.core.k8s_info:
+            api_version: packages.operators.coreos.com/v1
+            kind: PackageManifest
+            name: advanced-cluster-management
+            namespace: openshift-marketplace
+          register: acm_packagemanifest
+          when: acm_channel == ""
+
+        - name: Set ACM Channel
+          ansible.builtin.set_fact:
+            active_acm_channel: "{{ acm_channel | default(acm_packagemanifest.resources[0].status.defaultChannel, true) }}"
+
+        - name: Create ACM Namespace and OperatorGroup
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              - apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: open-cluster-management
+              - apiVersion: operators.coreos.com/v1
+                kind: OperatorGroup
+                metadata:
+                  name: acm-operator-group
+                  namespace: open-cluster-management
+                spec:
+                  targetNamespaces:
+                    - open-cluster-management
+
+        - name: Create ACM Subscription
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: operators.coreos.com/v1alpha1
+              kind: Subscription
+              metadata:
+                name: advanced-cluster-management
+                namespace: open-cluster-management
+              spec:
+                channel: "{{ active_acm_channel }}"
+                installPlanApproval: Automatic
+                name: advanced-cluster-management
+                source: redhat-operators
+                sourceNamespace: openshift-marketplace
+
+        - name: Wait for ACM Subscription to resolve CSV
+          kubernetes.core.k8s_info:
+            api_version: operators.coreos.com/v1alpha1
+            kind: Subscription
+            name: advanced-cluster-management
+            namespace: open-cluster-management
+          register: acm_sub
+          until: acm_sub.resources[0].status.currentCSV is defined
+          retries: "{{ csv_timeout // 10 }}"
+          delay: 10
+
+        - name: Wait for ACM CSV to Succeed
+          kubernetes.core.k8s_info:
+            api_version: operators.coreos.com/v1alpha1
+            kind: ClusterServiceVersion
+            name: "{{ acm_sub.resources[0].status.currentCSV }}"
+            namespace: open-cluster-management
+          register: acm_csv
+          until: 
+            - acm_csv.resources | length > 0
+            - acm_csv.resources[0].status.phase is defined
+            - acm_csv.resources[0].status.phase == 'Succeeded'
+          retries: "{{ csv_timeout // 10 }}"
+          delay: 10
+
+        - name: Create MultiClusterHub
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: operator.open-cluster-management.io/v1
+              kind: MultiClusterHub
+              metadata:
+                name: multiclusterhub
+                namespace: open-cluster-management
+              spec: {}
+
+        - name: Wait for MultiClusterHub to be Running
+          kubernetes.core.k8s_info:
+            api_version: operator.open-cluster-management.io/v1
+            kind: MultiClusterHub
+            name: multiclusterhub
+            namespace: open-cluster-management
+          register: mch_info
+          until: mch_info.resources[0].status.phase | default('') == 'Running'
+          retries: "{{ deploy_timeout // 30 }}"
+          delay: 30
+
+        - name: Get auto-created MultiClusterEngine
+          kubernetes.core.k8s_info:
+            api_version: multicluster.openshift.io/v1
+            kind: MultiClusterEngine
+          register: auto_mce_info
+
+        - name: Patch MultiClusterEngine to enable assisted-service
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: multicluster.openshift.io/v1
+              kind: MultiClusterEngine
+              metadata:
+                name: "{{ auto_mce_info.resources[0].metadata.name }}"
+              spec:
+                overrides:
+                  components:
+                    - name: assisted-service
+                      enabled: true
+          when: auto_mce_info.resources | length > 0
+
+        - name: Wait for MultiClusterEngine to be Available
+          kubernetes.core.k8s_info:
+            api_version: multicluster.openshift.io/v1
+            kind: MultiClusterEngine
+            name: "{{ auto_mce_info.resources[0].metadata.name }}"
+          register: patched_mce
+          until: patched_mce.resources[0].status.phase | default('') == 'Available'
+          retries: "{{ deploy_timeout // 30 }}"
+          delay: 30
+          when: auto_mce_info.resources | length > 0
+
+    # ==========================================
+    # MCE Deployment Block
+    # ==========================================
+    - name: Deploy MultiCluster Engine
+      when: deploy_target == 'mce'
+      block:
+        - name: Get MCE PackageManifest for default channel
+          kubernetes.core.k8s_info:
+            api_version: packages.operators.coreos.com/v1
+            kind: PackageManifest
+            name: multicluster-engine
+            namespace: openshift-marketplace
+          register: mce_packagemanifest
+          when: mce_channel == ""
+
+        - name: Set MCE Channel
+          ansible.builtin.set_fact:
+            active_mce_channel: "{{ mce_channel | default(mce_packagemanifest.resources[0].status.defaultChannel, true) }}"
+
+        - name: Create MCE Namespace and OperatorGroup
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              - apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: multicluster-engine
+              - apiVersion: operators.coreos.com/v1
+                kind: OperatorGroup
+                metadata:
+                  name: mce-operator-group
+                  namespace: multicluster-engine
+                spec:
+                  targetNamespaces:
+                    - multicluster-engine
+
+        - name: Create MCE Subscription
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: operators.coreos.com/v1alpha1
+              kind: Subscription
+              metadata:
+                name: multicluster-engine
+                namespace: multicluster-engine
+              spec:
+                channel: "{{ active_mce_channel }}"
+                installPlanApproval: Automatic
+                name: multicluster-engine
+                source: redhat-operators
+                sourceNamespace: openshift-marketplace
+
+        - name: Wait for MCE Subscription to resolve CSV
+          kubernetes.core.k8s_info:
+            api_version: operators.coreos.com/v1alpha1
+            kind: Subscription
+            name: multicluster-engine
+            namespace: multicluster-engine
+          register: mce_sub
+          until: mce_sub.resources[0].status.currentCSV is defined
+          retries: "{{ csv_timeout // 10 }}"
+          delay: 10
+
+        - name: Wait for MCE CSV to Succeed
+          kubernetes.core.k8s_info:
+            api_version: operators.coreos.com/v1alpha1
+            kind: ClusterServiceVersion
+            name: "{{ mce_sub.resources[0].status.currentCSV }}"
+            namespace: multicluster-engine
+          register: mce_csv
+          until: 
+            - mce_csv.resources | length > 0
+            - mce_csv.resources[0].status.phase is defined
+            - mce_csv.resources[0].status.phase == 'Succeeded'
+          retries: "{{ csv_timeout // 10 }}"
+          delay: 10
+
+        - name: Create MultiClusterEngine CR
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: multicluster.openshift.io/v1
+              kind: MultiClusterEngine
+              metadata:
+                name: multiclusterengine
+              spec:
+                overrides:
+                  components:
+                    - name: assisted-service
+                      enabled: true
+
+        - name: Wait for MultiClusterEngine to be Available
+          kubernetes.core.k8s_info:
+            api_version: multicluster.openshift.io/v1
+            kind: MultiClusterEngine
+            name: multiclusterengine
+          register: mce_info
+          until: mce_info.resources[0].status.phase | default('') == 'Available'
+          retries: "{{ deploy_timeout // 30 }}"
+          delay: 30
+
+    # ==========================================
+    # Common: Agent Service Setup
+    # ==========================================
+    - name: Setup Agent Service and ClusterImageSet
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          - apiVersion: agent-install.openshift.io/v1beta1
+            kind: AgentServiceConfig
+            metadata:
+              name: agent
+            spec:
+              databaseStorage:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: "{{ active_storage_class }}"
+                resources:
+                  requests:
+                    storage: 10Gi
+              filesystemStorage:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: "{{ active_storage_class }}"
+                resources:
+                  requests:
+                    storage: 20Gi
+              imageStorage:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: "{{ active_storage_class }}"
+                resources:
+                  requests:
+                    storage: 20Gi
+              osImages:
+                - openshiftVersion: "{{ ocp_minor }}"
+                  version: "{{ rhcos_version }}"
+                  url: "{{ rhcos_iso_url }}"
+                  cpuArchitecture: "{{ cluster_arch }}"
+
+          - apiVersion: hive.openshift.io/v1
+            kind: ClusterImageSet
+            metadata:
+              name: "img{{ ocp_version }}-{{ cluster_arch | replace('_', '-') }}"
+            spec:
+              releaseImage: "{{ release_image }}"
+...

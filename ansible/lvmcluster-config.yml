@@ -1,0 +1,112 @@
+---
+# Ansible playbook designed to run locally against your OpenShift cluster.
+# The OpenShift CLI (oc) is used to dynamically discover available worker
+# nodes, identify the root/OS drive via an oc debug container, map the
+# remaining available drives to their /dev/disk/by-id/ paths, and
+# automatically template and apply the LVMCluster Custom Resource (CR).
+#
+# Prerequisites
+# Authentication: Must be logged into the OpenShift cluster as a
+#    cluster-admin (oc login).
+#
+# LVM Operator: The LVM Storage Operator (Logical Volume Manager) must
+# already be installed from the OperatorHub. This playbook configures the
+# core instance (LVMCluster).
+#
+- name: Configure LVM Storage Operator on OpenShift Nodes
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Change this label selector if you want to target specific nodes (e.g., storage nodes)
+    node_selector: "node-role.kubernetes.io/worker"
+    operator_namespace: "openshift-storage"
+
+  tasks:
+    - name: Verify oc CLI is authenticated
+      command: oc whoami
+      register: oc_whoami
+      changed_when: false
+      failed_when: oc_whoami.rc != 0
+
+    - name: Get list of target OpenShift nodes
+      command: "oc get nodes -l {{ node_selector }} -o jsonpath='{.items[*].metadata.name}'"
+      register: target_nodes_raw
+      changed_when: false
+
+    - name: Set target nodes fact
+      set_fact:
+        target_nodes: "{{ target_nodes_raw.stdout.split(' ') | select('length') | list }}"
+
+    - name: Fail if no nodes are found
+      fail:
+        msg: "No nodes found matching the selector {{ node_selector }}"
+      when: target_nodes | length == 0
+
+    - name: Discover non-OS disks on each node via oc debug
+      # This script mounts the host, finds the disk holding /boot, 
+      # and returns the /dev/disk/by-id path for all OTHER disks.
+      shell: >
+        oc debug node/{{ item }} -- chroot /host /bin/bash -c
+        'BOOT_DEV=$(findmnt -vno SOURCE /boot | head -n 1);
+        OS_DISK=$(lsblk -no pkname $BOOT_DEV | head -n 1);
+        [ -z "$OS_DISK" ] && OS_DISK=$(basename $BOOT_DEV | tr -d "0-9");
+        for dev in $(lsblk -nd -o NAME,TYPE | awk "\$2==\"disk\" && \$1!~\"^loop\" {print \$1}"); do
+          if [ "$dev" != "$OS_DISK" ]; then
+            find /dev/disk/by-id -type l -lname "*/$dev" -print -quit;
+          fi;
+        done' 2>/dev/null | grep '^/dev/disk/by-id' || true
+      loop: "{{ target_nodes }}"
+      register: node_disks
+      changed_when: false
+
+    - name: Generate LVMCluster CR Manifest
+      copy:
+        dest: /tmp/lvmcluster-config.yaml
+        content: |
+          apiVersion: lvm.topolvm.io/v1alpha1
+          kind: LVMCluster
+          metadata:
+            name: lvmcluster
+            namespace: {{ operator_namespace }}
+          spec:
+            storage:
+              deviceClasses:
+              {% for result in node_disks.results %}
+              {% if result.stdout_lines | length > 0 %}
+              - name: vg-{{ result.item }}
+                deviceSelector:
+                  paths:
+                  {% for disk in result.stdout_lines %}
+                  - {{ disk }}
+                  {% endfor %}
+                nodeSelector:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values:
+                      - {{ result.item }}
+              {% endif %}
+              {% endfor %}
+      register: manifest_generation
+
+    - name: Ensure at least one valid disk was found across all nodes
+      shell: grep -q "deviceSelector" /tmp/lvmcluster-config.yaml
+      register: valid_manifest
+      ignore_errors: true
+      changed_when: false
+
+    - name: Fail if no additional drives were found
+      fail:
+        msg: "No available non-OS disks were found on any of the targeted nodes."
+      when: valid_manifest.rc != 0
+
+    - name: Apply the LVMCluster CR to the cluster
+      command: oc apply -f /tmp/lvmcluster-config.yaml
+      register: oc_apply
+      changed_when: "'configured' in oc_apply.stdout or 'created' in oc_apply.stdout"
+
+    - name: Display outcome
+      debug:
+        msg: "LVMCluster configuration successfully applied! The operator will now provision VolumeGroups on the discovered secondary drives."
+...
